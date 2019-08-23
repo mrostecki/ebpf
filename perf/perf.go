@@ -1,13 +1,17 @@
-package ebpf
+package perf
 
 import (
 	"encoding/binary"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/internal"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
@@ -22,14 +26,12 @@ type perfEventHeader struct {
 // perfEventRing is a page of metadata followed by
 // a variable number of pages which form a ring buffer.
 type perfEventRing struct {
-	fd   int
-	meta *unix.PerfEventMmapPage
-	mmap []byte
-	ring []byte
+	fd     int
+	mmap   []byte
+	reader *ringReader
 }
 
-func newPerfEventRing(cpu int, opts PerfReaderOptions) (*perfEventRing, error) {
-
+func newPerfEventRing(cpu int, opts ReaderOptions) (*perfEventRing, error) {
 	if opts.Watermark >= opts.PerCPUBuffer {
 		return nil, errors.Errorf("Watermark must be smaller than PerCPUBuffer")
 	}
@@ -63,10 +65,9 @@ func newPerfEventRing(cpu int, opts PerfReaderOptions) (*perfEventRing, error) {
 	meta := (*unix.PerfEventMmapPage)(unsafe.Pointer(&mmap[0]))
 
 	ring := &perfEventRing{
-		fd:   fd,
-		meta: meta,
-		mmap: mmap,
-		ring: mmap[meta.Data_offset : meta.Data_offset+meta.Data_size],
+		fd:     fd,
+		mmap:   mmap,
+		reader: newRingReader(meta, mmap[meta.Data_offset:meta.Data_offset+meta.Data_size]),
 	}
 	runtime.SetFinalizer(ring, (*perfEventRing).Close)
 
@@ -125,69 +126,92 @@ func createPerfEvent(cpu, watermark int) (int, error) {
 	}
 }
 
-func createEpollFd(fds ...int) (int, error) {
-	epollfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
-	if err != nil {
-		return -1, errors.Wrap(err, "can't create epoll fd")
+func addToEpoll(epollfd, fd int, data, pad int32) error {
+	// The representation of EpollEvent isn't entirely accurate.
+	// According to man 2 epoll_wait, Fd and Pad are really a union,
+	// and can be used to store arbitrary values, not just fds.
+	event := unix.EpollEvent{
+		Events: unix.EPOLLIN,
+		Fd:     data,
+		Pad:    pad,
 	}
 
-	for _, fd := range fds {
-		event := unix.EpollEvent{
-			Events: unix.EPOLLIN,
-			Fd:     int32(fd),
-		}
-
-		err := unix.EpollCtl(epollfd, unix.EPOLL_CTL_ADD, fd, &event)
-		if err != nil {
-			unix.Close(epollfd)
-			return -1, errors.Wrap(err, "can't add fd to epoll")
-		}
-	}
-
-	return epollfd, nil
+	err := unix.EpollCtl(epollfd, unix.EPOLL_CTL_ADD, fd, &event)
+	return errors.Wrap(err, "can't add fd to epoll")
 }
 
 func (ring *perfEventRing) Close() {
 	runtime.SetFinalizer(ring, nil)
 	unix.Close(ring.fd)
 	unix.Munmap(ring.mmap)
+
+	ring.fd = -1
+	ring.mmap = nil
 }
 
-func readRecord(rd io.Reader) (*PerfSample, uint64, error) {
+func (ring *perfEventRing) LoadHead() {
+	ring.reader.loadHead()
+}
+
+// NB: Has to be preceded by a call to LoadHead.
+func (ring *perfEventRing) ReadRecord() (*Record, error) {
+	if ring.fd == -1 {
+		return nil, errors.New("closed")
+	}
+
+	defer ring.reader.writeTail()
+	return readRecord(ring.reader)
+}
+
+// Record contains either a sample or a counter of the
+// number of lost samples.
+type Record struct {
+	// The data submitted via bpf_perf_event_output.
+	// They are padded with 0 to have a 64-bit alignment.
+	// If you are using variable length samples you need to take
+	// this into account.
+	RawSample []byte
+
+	// The number of samples which could not be output, since
+	// the ring buffer was full.
+	LostSamples uint64
+}
+
+func readRecord(rd io.Reader) (*Record, error) {
 	const (
 		perfRecordLost   = 2
 		perfRecordSample = 9
 	)
 
 	var header perfEventHeader
-	err := binary.Read(rd, nativeEndian, &header)
+	err := binary.Read(rd, internal.NativeEndian, &header)
 	if err == io.EOF {
-		return nil, 0, nil
+		return nil, nil
 	}
 
 	if err != nil {
-		return nil, 0, errors.Wrap(err, "can't read event header")
+		return nil, errors.Wrap(err, "can't read event header")
 	}
 
 	switch header.Type {
 	case perfRecordLost:
 		lost, err := readLostRecords(rd)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 
-		return nil, lost, nil
+		return &Record{LostSamples: lost}, nil
 
 	case perfRecordSample:
-		sample, err := readSample(rd)
+		raw, err := readRawSample(rd)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 
-		return sample, 0, nil
+		return &Record{RawSample: raw}, nil
 
 	default:
-		return nil, 0, errors.Errorf("unknown event type %d", header.Type)
+		return nil, errors.Errorf("unknown event type %d", header.Type)
 	}
 }
 
@@ -197,7 +221,7 @@ func readLostRecords(rd io.Reader) (uint64, error) {
 		Lost uint64
 	}
 
-	err := binary.Read(rd, nativeEndian, &lostHeader)
+	err := binary.Read(rd, internal.NativeEndian, &lostHeader)
 	if err != nil {
 		return 0, errors.Wrap(err, "can't read lost records header")
 	}
@@ -205,87 +229,83 @@ func readLostRecords(rd io.Reader) (uint64, error) {
 	return lostHeader.Lost, nil
 }
 
-func readSample(rd io.Reader) (*PerfSample, error) {
+func readRawSample(rd io.Reader) ([]byte, error) {
 	var size uint32
-	if err := binary.Read(rd, nativeEndian, &size); err != nil {
+	if err := binary.Read(rd, internal.NativeEndian, &size); err != nil {
 		return nil, errors.Wrap(err, "can't read sample size")
 	}
 
 	data := make([]byte, int(size))
 	_, err := io.ReadFull(rd, data)
-	return &PerfSample{data}, errors.Wrap(err, "can't read sample")
+	return data, errors.Wrap(err, "can't read sample")
 }
 
-// PerfSample is read from the kernel by PerfReader.
-type PerfSample struct {
-	// Data are padded with 0 to have a 64-bit alignment.
-	// If you are using variable length samples you need to take
-	// this into account.
-	Data []byte
-}
-
-// PerfReader allows reading bpf_perf_event_output
+// Reader allows reading bpf_perf_event_output
 // from user space.
-type PerfReader struct {
-	lostSamples uint64
+type Reader struct {
+	mu sync.Mutex
+
 	// Closing a PERF_EVENT_ARRAY removes all event fds
 	// stored in it, so we keep a reference alive.
-	array *Map
+	array *ebpf.Map
+	rings []*perfEventRing
 
+	epollFd     int
+	epollEvents []unix.EpollEvent
+	epollRings  []*perfEventRing
 	// Eventfds for closing
-	closeFd      int
-	flushCloseFd int
+	closeFd int
 	// Ensure we only close once
 	closeOnce sync.Once
-	// Channel to interrupt polling blocked on writing to consumer
-	stopWriter chan struct{}
-	// Channel closed when poll() is done
-	closed chan struct{}
-
-	// Error receives a write if the reader exits
-	// due to an error.
-	Error <-chan error
-
-	// Samples is closed when the Reader exits.
-	Samples <-chan *PerfSample
 }
 
-// PerfReaderOptions control the behaviour of the user
+// ReaderOptions control the behaviour of the user
 // space reader.
-type PerfReaderOptions struct {
-	// A map of type PerfEventArray. The reader takes ownership of the
-	// map and takes care of closing it.
-	Map *Map
-	// Controls the size of the per CPU buffer in bytes. LostSamples() will
-	// increase if the buffer is too small.
+type ReaderOptions struct {
+	// A map of type PerfEventArray.
+	Map *ebpf.Map
+	// Controls the size of the per CPU buffer in bytes.
 	PerCPUBuffer int
-	// The reader will start processing samples once the per CPU buffer
-	// exceeds this value. Must be smaller than PerCPUBuffer.
+	// The number of written bytes required in any per CPU buffer before
+	// Read will process data. Must be smaller than PerCPUBuffer.
 	Watermark int
 }
 
-// NewPerfReader creates a new reader with the given options.
-//
-// The value returned by LostSamples() will increase if the buffer
-// isn't large enough to contain all incoming samples.
-func NewPerfReader(opts PerfReaderOptions) (out *PerfReader, err error) {
+const (
+	// Sentinel value passed in EpollEvent.Pad
+	wokenByClose = 1
+)
+
+// NewReader creates a new reader with the given options.
+func NewReader(opts ReaderOptions) (pr *Reader, err error) {
 	if opts.PerCPUBuffer < 1 {
 		return nil, errors.New("PerCPUBuffer must be larger than 0")
 	}
 
 	// We can't create a ring for CPUs that aren't online, so use only the online (of possible) CPUs
-	nCPU, err := onlineCPUs()
+	nCPU, err := internal.OnlineCPUs()
 	if err != nil {
 		return nil, errors.Wrap(err, "sampled perf event")
 	}
+	if int64(nCPU) > math.MaxInt32 {
+		return nil, errors.Errorf("unsupported number of CPUs: %d", nCPU)
+	}
+
+	epollFd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
+	if err != nil {
+		return nil, errors.Wrap(err, "can't create epoll fd")
+	}
 
 	var (
-		fds   []int
-		rings = make(map[int]*perfEventRing)
+		fds   = []int{epollFd}
+		rings = make([]*perfEventRing, 0, nCPU)
 	)
 
 	defer func() {
 		if err != nil {
+			for _, fd := range fds {
+				unix.Close(fd)
+			}
 			for _, ring := range rings {
 				ring.Close()
 			}
@@ -300,200 +320,147 @@ func NewPerfReader(opts PerfReaderOptions) (out *PerfReader, err error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create perf ring for CPU %d", i)
 		}
+		rings = append(rings, ring)
 
 		if err := opts.Map.Put(uint32(i), uint32(ring.fd)); err != nil {
-			ring.Close()
 			return nil, errors.Wrapf(err, "could't put event fd for CPU %d", i)
 		}
 
-		fds = append(fds, ring.fd)
-		rings[ring.fd] = ring
+		if err := addToEpoll(epollFd, ring.fd, int32(len(rings)-1), 0); err != nil {
+			return nil, err
+		}
 	}
 
 	closeFd, err := unix.Eventfd(0, unix.O_CLOEXEC|unix.O_NONBLOCK)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			unix.Close(closeFd)
-		}
-	}()
 	fds = append(fds, closeFd)
 
-	flushCloseFd, err := unix.Eventfd(0, unix.O_CLOEXEC|unix.O_NONBLOCK)
-	if err != nil {
+	if err := addToEpoll(epollFd, closeFd, 0, wokenByClose); err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			unix.Close(flushCloseFd)
-		}
-	}()
-	fds = append(fds, flushCloseFd)
 
-	epollFd, err := createEpollFd(fds...)
+	array, err := opts.Map.Clone()
 	if err != nil {
 		return nil, err
 	}
 
-	samples := make(chan *PerfSample, nCPU)
-	errs := make(chan error, 1)
-
-	out = &PerfReader{
-		array:        opts.Map,
-		closeFd:      closeFd,
-		flushCloseFd: flushCloseFd,
-		stopWriter:   make(chan struct{}),
-		closed:       make(chan struct{}),
-		Error:        errs,
-		Samples:      samples,
+	pr = &Reader{
+		array:   array,
+		rings:   rings,
+		epollFd: epollFd,
+		// Allocate extra event for closeFd
+		epollEvents: make([]unix.EpollEvent, len(rings)+1),
+		epollRings:  make([]*perfEventRing, 0, len(rings)),
+		closeFd:     closeFd,
 	}
-	runtime.SetFinalizer(out, (*PerfReader).Close)
-
-	go out.poll(epollFd, rings, samples, errs)
-
-	return out, nil
+	runtime.SetFinalizer(pr, (*Reader).Close)
+	return pr, nil
 }
 
-// LostSamples returns the number of samples dropped
-// by the perf subsystem.
-func (pr *PerfReader) LostSamples() uint64 {
-	return atomic.LoadUint64(&pr.lostSamples)
-}
-
-// Close stops the reader, discarding any samples not yet written to 'Samples'.
+// Close frees resources used by the reader.
+//
+// It interrupts calls to Read.
 //
 // Calls to perf_event_output from eBPF programs will return
 // ENOENT after calling this method.
-func (pr *PerfReader) Close() (err error) {
-	return pr.close(false)
-}
-
-// FlushAndClose stops the reader, flushing any samples to 'Samples'.
-// Will block if no consumer reads from 'Samples'.
-//
-// Calls to perf_event_output from eBPF programs will return
-// ENOENT after calling this method.
-func (pr *PerfReader) FlushAndClose() error {
-	return pr.close(true)
-}
-
-func (pr *PerfReader) close(flush bool) error {
+func (pr *Reader) Close() error {
+	var err error
 	pr.closeOnce.Do(func() {
 		runtime.SetFinalizer(pr, nil)
 
-		// Interrupt polling so we don't deadlock if the consumer is dead
-		if !flush {
-			close(pr.stopWriter)
-		}
-
-		// Signal poll() via the event fd. Ignore the
-		// write error since poll() may have exited
-		// and closed the fd already
+		// Interrupt Read() via the event fd.
 		var value [8]byte
-		nativeEndian.PutUint64(value[:], 1)
-		if flush {
-			_, _ = unix.Write(pr.flushCloseFd, value[:])
-		} else {
-			_, _ = unix.Write(pr.closeFd, value[:])
+		internal.NativeEndian.PutUint64(value[:], 1)
+		_, err = unix.Write(pr.closeFd, value[:])
+		if err != nil {
+			err = errors.Wrap(err, "can't write event fd")
+			return
 		}
-	})
 
-	// Wait until poll is done
-	<-pr.closed
+		// Acquire the lock. This ensures that Read
+		// isn't running.
+		pr.mu.Lock()
+		defer pr.mu.Unlock()
 
-	return nil
-}
+		unix.Close(pr.epollFd)
+		unix.Close(pr.closeFd)
+		pr.epollFd, pr.closeFd = -1, -1
 
-func (pr *PerfReader) poll(epollFd int, rings map[int]*perfEventRing, samples chan<- *PerfSample, errs chan<- error) {
-	// last as it means we're done
-	defer close(pr.closed)
-	defer close(samples)
-	defer pr.array.Close()
-	defer unix.Close(epollFd)
-	defer unix.Close(pr.closeFd)
-	defer unix.Close(pr.flushCloseFd)
-	defer func() {
-		for _, ring := range rings {
+		// Close rings
+		for _, ring := range pr.rings {
 			ring.Close()
 		}
-	}()
+		pr.rings = nil
 
-	epollEvents := make([]unix.EpollEvent, len(rings)+1)
+		pr.array.Close()
+	})
+
+	return errors.Wrap(err, "close PerfReader")
+}
+
+// Read the next record from the perf ring buffer.
+//
+// The function blocks until there are at least Watermark bytes in one
+// of the per CPU buffers.
+//
+// Records from buffers below the Watermark are not returned.
+//
+// Calling Close interrupts the function.
+func (pr *Reader) Read() (*Record, error) {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+
+	if pr.epollFd == -1 {
+		return nil, errors.New("closed")
+	}
 
 	for {
-		nEvents, err := unix.EpollWait(epollFd, epollEvents, -1)
-		if err != nil {
+		if len(pr.epollRings) == 0 {
+			nEvents, err := unix.EpollWait(pr.epollFd, pr.epollEvents, -1)
+
 			// Handle EINTR
 			if temp, ok := err.(temporaryError); ok && temp.Temporary() {
 				continue
 			}
 
-			errs <- err
-			return
-		}
-
-		for _, event := range epollEvents[:nEvents] {
-			fd := int(event.Fd)
-			if fd == pr.closeFd {
-				// We were woken by Close via the close fd
-				return
+			if err != nil {
+				return nil, err
 			}
 
-			if fd == pr.flushCloseFd {
-				for _, ring := range rings {
-					err := pr.flushRing(ring, samples)
-					if err != nil {
-						errs <- err
-						return
-					}
+			for _, event := range pr.epollEvents[:nEvents] {
+				if event.Pad == wokenByClose {
+					return nil, errors.New("closed")
 				}
 
-				return
-			}
+				ring := pr.rings[int(event.Fd)]
+				pr.epollRings = append(pr.epollRings, ring)
 
-			err := pr.flushRing(rings[fd], samples)
-			if err != nil {
-				errs <- err
-				return
+				// Read the current head pointer now, not every time
+				// we read a record. This prevents a single fast producer
+				// from keeping the reader busy.
+				ring.LoadHead()
 			}
 		}
-	}
-}
 
-func (pr *PerfReader) flushRing(ring *perfEventRing, samples chan<- *PerfSample) error {
-	rd := newRingReader(ring.meta, ring.ring)
-	defer rd.Close()
-
-	var totalLost uint64
-
-	for {
-		sample, lost, err := readRecord(rd)
+		// Start at the last available event. The order in which we
+		// process them doesn't matter, and starting at the back allows
+		// resizing epollRings to keep track of processed rings.
+		record, err := pr.epollRings[len(pr.epollRings)-1].ReadRecord()
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		if lost > 0 {
-			totalLost += lost
+		if record == nil {
+			// We've emptied the current ring buffer, process
+			// the next one.
+			pr.epollRings = pr.epollRings[:len(pr.epollRings)-1]
 			continue
 		}
 
-		if sample == nil {
-			break
-		}
-
-		select {
-		case samples <- sample:
-		case <-pr.stopWriter:
-			break
-		}
+		return record, nil
 	}
-
-	if totalLost > 0 {
-		atomic.AddUint64(&pr.lostSamples, totalLost)
-	}
-	return nil
 }
 
 type ringReader struct {
@@ -514,31 +481,34 @@ func newRingReader(meta *unix.PerfEventMmapPage, ring []byte) *ringReader {
 	}
 }
 
-func (rb *ringReader) Close() error {
-	// Commit the new tail. This lets the kernel know that
-	// the ring buffer has been consumed.
-	atomic.StoreUint64(&rb.meta.Data_tail, rb.tail)
-	return nil
+func (rr *ringReader) loadHead() {
+	rr.head = atomic.LoadUint64(&rr.meta.Data_head)
 }
 
-func (rb *ringReader) Read(p []byte) (int, error) {
-	start := int(rb.tail & rb.mask)
+func (rr *ringReader) writeTail() {
+	// Commit the new tail. This lets the kernel know that
+	// the ring buffer has been consumed.
+	atomic.StoreUint64(&rr.meta.Data_tail, rr.tail)
+}
+
+func (rr *ringReader) Read(p []byte) (int, error) {
+	start := int(rr.tail & rr.mask)
 
 	n := len(p)
 	// Truncate if the read wraps in the ring buffer
-	if remainder := cap(rb.ring) - start; n > remainder {
+	if remainder := cap(rr.ring) - start; n > remainder {
 		n = remainder
 	}
 
 	// Truncate if there isn't enough data
-	if remainder := int(rb.head - rb.tail); n > remainder {
+	if remainder := int(rr.head - rr.tail); n > remainder {
 		n = remainder
 	}
 
-	copy(p, rb.ring[start:start+n])
-	rb.tail += uint64(n)
+	copy(p, rr.ring[start:start+n])
+	rr.tail += uint64(n)
 
-	if rb.tail == rb.head {
+	if rr.tail == rr.head {
 		return n, io.EOF
 	}
 
